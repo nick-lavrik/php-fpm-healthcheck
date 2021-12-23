@@ -1,0 +1,280 @@
+#!/usr/bin/env php
+<?php
+
+/**
+ * https://fastcgi-archives.github.io/FastCGI_Specification.html
+ */
+
+declare(strict_types=1);
+
+if (!in_array(PHP_SAPI, ['cli', 'phpdbg', 'embed'], true)) {
+    echo 'Warning: The script should be invoked via the CLI version of PHP, not the ' . PHP_SAPI . ' SAPI' . PHP_EOL;
+}
+
+$argv = $argv ?? $_SERVER['argv'] ?? [];
+$opts = getopt('h',['help', 'usage'], $rest);
+if (array_intersect(array_keys($opts), ['h', 'help', 'usage']) || count($argv) === 1) {
+    echo "Usage ${argv[0]} tcp://127.0.0.1:9000/ping\n\n";
+    die(0);
+}
+
+$fastCgi = new class ($argv[1] ?? 'tcp://127.0.0.1/ping') {
+    public const FASTCGI_HEADER_LENGTH  = 8;
+    public const FASTCGI_VERSION_1      = 1;
+
+    /** Values for type component of FCGI_Header */
+    public const FASTCGI_BEGIN_REQUEST     = 1;
+    public const FASTCGI_ABORT_REQUEST     = 2;
+    public const FASTCGI_END_REQUEST       = 3;
+    public const FASTCGI_PARAMS            = 4;
+    public const FASTCGI_STDIN             = 5;
+    public const FASTCGI_STDOUT            = 6;
+    public const FASTCGI_STDERR            = 7;
+    public const FASTCGI_DATA              = 8;
+    public const FASTCGI_GET_VALUES        = 9;
+    public const FASTCGI_GET_VALUES_RESULT = 10;
+    public const FASTCGI_UNKNOWN_TYPE      = 11;
+
+    /** Mask for flags component of FCGI_BeginRequestBody */
+    public const FASTCGI_CLOSE_CONNECTION  = 0;
+    public const FASTCGI_KEEP_CONNECTION   = 1;
+
+    /** Values for role component of FCGI_BeginRequestBody */
+    public const FASTCGI_RESPONDER   = 1;
+    public const FASTCGI_AUTHORIZER  = 2;
+    public const FASTCGI_FILTER      = 3;
+
+    /** Values for protocolStatus component of FCGI_EndRequestBody */
+    public const FASTCGI_REQUEST_COMPLETE     = 0;
+    public const FASTCGI_CANT_MPX_CONNECTION  = 1;
+    public const FASTCGI_OVERLOADED           = 2;
+    public const FASTCGI_UNKNOWN_ROLE         = 3;
+
+    /** Variable names for FCGI_GET_VALUES / FCGI_GET_VALUES_RESULT records */
+    public const FASTCGI_MAX_CONNS  = 'FCGI_MAX_CONNS';
+    public const FASTCGI_MAX_REQS   = 'FCGI_MAX_REQS';
+    public const FASTCGI_MPXS_CONNS = 'FCGI_MPXS_CONNS';
+
+    /** @var string */
+    private $address;
+    /** @var string*/
+    private $url;
+    /** @var string */
+    private $method;
+
+    /** @var resource|null */
+    private $socket;
+
+    /** @var string */
+    private $response;
+    /** @var int */
+    private $requestId = 1;
+
+    public function __construct(string $uri = null, string $method = 'GET')
+    {
+        $info = array_merge(
+            [
+                'scheme' => 'tcp',
+                'host' => '127.0.0.1',
+                'port' => 9000,
+                'path' => '/ping'
+            ],
+            parse_url($uri)
+        );
+        $this->address = sprintf('%s://%s:%d', $info['scheme'], $info['host'], $info['port']);
+        $this->url = $info['path'];
+        $this->method = $method;
+    }
+
+    public function apply(): string
+    {
+        $this->fcgiBeginRequest();
+        $this->fcgiParams($this->env());
+        $this->fcgiParams([]); // finishRequest
+        $this->fcgiStdin('');
+        $this->fcgiStdout();
+        $this->fcgiEndRequest();
+        $this->close();
+
+        return $this->response;
+    }
+
+    private function env(): array
+    {
+        return [
+            'REQUEST_METHOD' => $this->method,
+            'SCRIPT_NAME' => $this->url,
+            'SCRIPT_FILENAME' => $this->url,
+            'REQUEST_URI' => $this->url,
+        ];
+    }
+
+    private function fcgiBeginRequest(): void
+    {
+        // FCGI_Header header
+        $this->write(pack(
+            'CCnnCx',
+            self::FASTCGI_VERSION_1,     // C - version
+            self::FASTCGI_BEGIN_REQUEST, // C - type
+            $this->requestId,            // n - requestId
+            self::FASTCGI_HEADER_LENGTH, // n - contentLength
+            0                            // C - paddingLength
+        ));
+
+        // FCGI_BeginRequestBody
+        $this->write(pack(
+            'nCxxxxx',
+            self::FASTCGI_RESPONDER,       // n - role
+            self::FASTCGI_CLOSE_CONNECTION // C - flags
+        ));
+    }
+
+    private function fcgiParams(array $params): void
+    {
+        $params = $this->encodeFcgiParams($params);
+        $this->write(pack(
+            'CCnnCx',
+            self::FASTCGI_VERSION_1, // C
+            self::FASTCGI_PARAMS,    // C - type
+            $this->requestId,        // n - requestId
+            strlen($params),         // n - contentLength
+            0                        // C - paddingLength
+        ));
+
+        $this->write($params);
+    }
+
+    /** @noinspection PhpSameParameterValueInspection */
+    private function fcgiStdin(string $content): void
+    {
+        $this->write(pack(
+            'CCnnCx',
+            self::FASTCGI_VERSION_1, // C
+            self::FASTCGI_STDIN,     // C - type
+            $this->requestId,        // n - requestId
+            strlen($content),        // n - contentLength
+            0                        // C - paddingLength
+        ));
+        $this->write($content);
+    }
+
+    private function fcgiStdout(): void
+    {
+        $header = $this->read(self::FASTCGI_HEADER_LENGTH);
+        $data = unpack('Cprotocol/Ctype/nid/nlength/Cpadding', $header);
+
+        if ($data['protocol'] !== self::FASTCGI_VERSION_1) {
+            throw new RuntimeException('Invalid protocol in response');
+        }
+
+        if ($data['type'] !== self::FASTCGI_STDOUT) {
+            throw new RuntimeException('something went wrong - wrong packet');
+        }
+
+        if ($data['id'] !== $this->requestId) {
+            throw new RuntimeException('got response from another request');
+        }
+
+        $this->response = $this->read($data['length']);
+        if (strlen($this->response) !== $data['length']) {
+            throw new RuntimeException('invalid response length');
+        }
+
+        $this->read($data['padding']); // flush buffer
+    }
+
+    private function fcgiEndRequest(): void
+    {
+        $header = $this->read(self::FASTCGI_HEADER_LENGTH);
+        $data = unpack('Cprotocol/Ctype/nid/nlength/Cstatus', $header);
+
+        if ($data['protocol'] !== self::FASTCGI_VERSION_1) {
+            throw new RuntimeException('Invalid protocol in response');
+        }
+
+        if ($data['type'] !== self::FASTCGI_END_REQUEST) {
+            throw new RuntimeException('wrong packet type');
+        }
+
+        if ($data['id'] !== $this->requestId) {
+            throw new RuntimeException('got response from another request');
+        }
+
+        if ($data['length'] !== self::FASTCGI_HEADER_LENGTH) {
+            throw new RuntimeException('invalid length in close connection');
+        }
+
+        if ($data['status'] !== self::FASTCGI_REQUEST_COMPLETE) {
+            throw new RuntimeException('server dont complete request');
+        }
+    }
+
+    private function encodeFcgiParams(array $parameters): string
+    {
+        $result = '';
+
+        foreach ($parameters as $key => $value) {
+            $lenKeyChar = $this->packLength($key);
+            $valLenChar = $this->packLength($value);
+
+            $result .= $lenKeyChar . $valLenChar . $key . $value;
+        }
+
+        return $result;
+    }
+
+    private function packLength(string $value): string
+    {
+        $length = strlen($value);
+
+        return $length < 128 ? chr($length) : pack('N', $length);
+    }
+
+    private function close(): void
+    {
+        if ($this->socket) {
+            fclose($this->socket);
+        }
+
+        $this->socket = null;
+    }
+
+    private function write(string $content)
+    {
+        if (fwrite($this->socket(), $content) === false) {
+            throw new RuntimeException('socket write fail');
+        }
+    }
+
+    private function read(int $length): string
+    {
+        $result = '';
+        while ($length --) {
+            $result .= fread($this->socket(), 1);
+        }
+
+        return $result;
+    }
+
+    /** @return resource */
+    private function socket()
+    {
+        $errno = $error = null;
+        if (!$this->socket) {
+            $this->socket = stream_socket_client($this->address, $errno, $error);
+        }
+
+        if (!$this->socket) {
+            throw new RuntimeException("[$errno] $error\n");
+        }
+
+        return $this->socket;
+    }
+
+    public function __destruct()
+    {
+        $this->close();
+    }
+};
+
+echo $fastCgi->apply();
